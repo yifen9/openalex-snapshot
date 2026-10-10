@@ -1,0 +1,29 @@
+[package]
+name = "openalex-snapshot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+arrow-array = "60"
+arrow-schema = "60"
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+object_store = { version = "0.14", features = ["aws"] }
+parquet = { version = "60", features = ["async", "object_store"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+toml = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
