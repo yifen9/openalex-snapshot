@@ -1,11 +1,24 @@
 use crate::s3::{Manifest, parse_id};
-use crate::works::bare_doi;
+use crate::works::{bare_doi, bare_orcid};
 
 #[test]
 fn dois_lose_their_resolver_prefix() {
     assert_eq!(bare_doi("https://doi.org/10.1000/xyz"), "10.1000/xyz");
     assert_eq!(bare_doi("http://doi.org/10.1000/xyz"), "10.1000/xyz");
     assert_eq!(bare_doi("10.1000/xyz"), "10.1000/xyz");
+}
+
+#[test]
+fn orcids_lose_their_resolver_prefix() {
+    assert_eq!(
+        bare_orcid("https://orcid.org/0000-0002-1825-0097"),
+        "0000-0002-1825-0097"
+    );
+    assert_eq!(
+        bare_orcid("http://orcid.org/0000-0002-1825-0097"),
+        "0000-0002-1825-0097"
+    );
+    assert_eq!(bare_orcid("0000-0002-1825-0097"), "0000-0002-1825-0097");
 }
 
 #[test]

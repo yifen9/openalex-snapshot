@@ -58,6 +58,7 @@ pub static ROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("n_institutions", DataType::UInt16, false),
         Field::new("language", DataType::Utf8, true),
         Field::new("doi", DataType::Utf8, true),
+        Field::new("orcid_id", DataType::Utf8, true),
     ]))
 });
 
@@ -81,6 +82,7 @@ pub struct FileStats {
 #[derive(Clone, Copy)]
 struct Slot {
     author: u64,
+    authorship: usize,
     orcid: bool,
     position: u8,
     institution: u64,
@@ -107,6 +109,7 @@ struct RowColumns {
     institutions: Vec<u16>,
     language: StringBuilder,
     doi: StringBuilder,
+    orcid_id: StringBuilder,
 }
 
 struct WorkColumns<'a> {
@@ -167,6 +170,13 @@ impl<'a> WorkColumns<'a> {
 
 fn optional_id<T: FromStr + Default>(array: &StringArray, index: usize) -> Result<T> {
     optional(array, index).map_or(Ok(T::default()), parse_id)
+}
+
+pub fn bare_orcid(value: &str) -> &str {
+    value
+        .strip_prefix("https://orcid.org/")
+        .or_else(|| value.strip_prefix("http://orcid.org/"))
+        .unwrap_or(value)
 }
 
 pub fn bare_doi(value: &str) -> &str {
@@ -240,6 +250,7 @@ impl Explode {
             for &institution in &self.ids {
                 self.slots.push(Slot {
                     author,
+                    authorship,
                     orcid,
                     position,
                     institution,
@@ -306,6 +317,11 @@ impl Explode {
             columns.institutions.push(slot.count);
             columns.language.append_option(language);
             columns.doi.append_option(doi);
+            columns.orcid_id.append_option(
+                optional(works.orcid, slot.authorship)
+                    .filter(|s| !s.is_empty())
+                    .map(bare_orcid),
+            );
         }
         self.stats.rows += self.slots.len() as u64;
         Ok(())
@@ -335,6 +351,7 @@ impl Explode {
             Arc::new(UInt16Array::from(c.institutions)),
             Arc::new({ c.language }.finish()),
             Arc::new({ c.doi }.finish()),
+            Arc::new({ c.orcid_id }.finish()),
         ];
         Ok(Some(RecordBatch::try_new(Arc::clone(&ROW_SCHEMA), arrays)?))
     }
