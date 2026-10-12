@@ -34,6 +34,7 @@ const LOOKUPS: [(&str, &[Leaf]); 4] = [
             ("id", "id"),
             ("display_name", "display_name"),
             ("type", "type"),
+            ("country_code", "country_code"),
         ],
     ),
     ("fields", &[("id", "id"), ("display_name", "display_name")]),

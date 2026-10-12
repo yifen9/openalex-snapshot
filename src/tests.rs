@@ -1,4 +1,12 @@
 use crate::s3::{Manifest, parse_id};
+use crate::works::bare_doi;
+
+#[test]
+fn dois_lose_their_resolver_prefix() {
+    assert_eq!(bare_doi("https://doi.org/10.1000/xyz"), "10.1000/xyz");
+    assert_eq!(bare_doi("http://doi.org/10.1000/xyz"), "10.1000/xyz");
+    assert_eq!(bare_doi("10.1000/xyz"), "10.1000/xyz");
+}
 
 #[test]
 fn ids_parse_from_urls_and_prefixed_strings() {

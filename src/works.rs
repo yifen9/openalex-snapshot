@@ -18,8 +18,10 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
-pub const WORK_LEAVES: [&str; 15] = [
+pub const WORK_LEAVES: [&str; 17] = [
     "id",
+    "doi",
+    "language",
     "publication_year",
     "type",
     "is_xpac",
@@ -54,6 +56,8 @@ pub static ROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("position", DataType::UInt8, false),
         Field::new("institution_id", DataType::UInt64, false),
         Field::new("n_institutions", DataType::UInt16, false),
+        Field::new("language", DataType::Utf8, true),
+        Field::new("doi", DataType::Utf8, true),
     ]))
 });
 
@@ -101,10 +105,14 @@ struct RowColumns {
     position: Vec<u8>,
     institution: Vec<u64>,
     institutions: Vec<u16>,
+    language: StringBuilder,
+    doi: StringBuilder,
 }
 
 struct WorkColumns<'a> {
     id: &'a StringArray,
+    doi: &'a StringArray,
+    language: &'a StringArray,
     year: &'a Int32Array,
     work_type: &'a StringArray,
     xpac: &'a BooleanArray,
@@ -130,6 +138,8 @@ impl<'a> WorkColumns<'a> {
         let institutions: &ListArray = member(authorships.values(), "institutions")?;
         Ok(WorkColumns {
             id: column(batch, "id")?,
+            doi: column(batch, "doi")?,
+            language: column(batch, "language")?,
             year: column(batch, "publication_year")?,
             work_type: column(batch, "type")?,
             xpac: column(batch, "is_xpac")?,
@@ -157,6 +167,13 @@ impl<'a> WorkColumns<'a> {
 
 fn optional_id<T: FromStr + Default>(array: &StringArray, index: usize) -> Result<T> {
     optional(array, index).map_or(Ok(T::default()), parse_id)
+}
+
+pub fn bare_doi(value: &str) -> &str {
+    value
+        .strip_prefix("https://doi.org/")
+        .or_else(|| value.strip_prefix("http://doi.org/"))
+        .unwrap_or(value)
 }
 
 fn position_code(value: Option<&str>) -> u8 {
@@ -267,6 +284,8 @@ impl Explode {
         let top10 = works.flag(works.top10, index);
         let top1 = works.flag(works.top1, index);
         let authors = u16::try_from(end - start).unwrap_or(u16::MAX);
+        let language = optional(works.language, index);
+        let doi = optional(works.doi, index).map(bare_doi);
         let columns = &mut self.columns;
         for slot in &self.slots {
             columns.work.push(work);
@@ -285,6 +304,8 @@ impl Explode {
             columns.position.push(slot.position);
             columns.institution.push(slot.institution);
             columns.institutions.push(slot.count);
+            columns.language.append_option(language);
+            columns.doi.append_option(doi);
         }
         self.stats.rows += self.slots.len() as u64;
         Ok(())
@@ -312,6 +333,8 @@ impl Explode {
             Arc::new(UInt8Array::from(c.position)),
             Arc::new(UInt64Array::from(c.institution)),
             Arc::new(UInt16Array::from(c.institutions)),
+            Arc::new({ c.language }.finish()),
+            Arc::new({ c.doi }.finish()),
         ];
         Ok(Some(RecordBatch::try_new(Arc::clone(&ROW_SCHEMA), arrays)?))
     }
