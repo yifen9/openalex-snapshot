@@ -29,6 +29,14 @@ fn ids_parse_from_urls_and_prefixed_strings() {
     );
     assert_eq!(parse_id::<u64>("I136199984").ok(), Some(136199984));
     assert!(parse_id::<u64>("https://openalex.org/").is_err());
+    assert_eq!(
+        parse_id::<u16>("https://openalex.org/T12777").ok(),
+        Some(12777)
+    );
+    assert_eq!(
+        parse_id::<u64>("https://openalex.org/subfields/1710").ok(),
+        Some(1710)
+    );
 }
 
 #[test]

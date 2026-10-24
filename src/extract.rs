@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::io::{write_atomic, write_json};
 use crate::lookup::{Leaf, extract_lookup};
 use crate::s3::{SourceFile, manifest, store};
-use crate::works::{FileStats, completed_stats, extract_file};
+use crate::works::{FileStats, Outputs, completed_stats, extract_file};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const RETRIES: u32 = 3;
-const LOOKUPS: [(&str, &[Leaf]); 4] = [
+const LOOKUPS: [(&str, &[Leaf]); 6] = [
     (
         "institutions",
         &[
@@ -42,6 +42,17 @@ const LOOKUPS: [(&str, &[Leaf]); 4] = [
         "subfields",
         &[("id", "id"), ("display_name", "display_name")],
     ),
+    ("domains", &[("id", "id"), ("display_name", "display_name")]),
+    (
+        "topics",
+        &[
+            ("id", "id"),
+            ("display_name", "display_name"),
+            ("subfield.id", "subfield_id"),
+            ("field.id", "field_id"),
+            ("domain.id", "domain_id"),
+        ],
+    ),
 ];
 
 #[derive(Debug, Default, Serialize)]
@@ -50,6 +61,8 @@ struct WorksSummary {
     records: u64,
     works: u64,
     rows: u64,
+    topics: u64,
+    titles: u64,
     bytes: u64,
 }
 
@@ -102,9 +115,6 @@ async fn extract_works(
     dir: &Path,
     config: &Config,
 ) -> Result<()> {
-    let works_dir = dir.join("works");
-    std::fs::create_dir_all(&works_dir)
-        .with_context(|| format!("creating {}", works_dir.display()))?;
     let (min_year, max_year) = (config.corpus.min_year, config.corpus.max_year);
     let concurrency = config.snapshot.concurrency;
     let total = sources.len();
@@ -112,9 +122,9 @@ async fn extract_works(
     let mut tasks = futures::stream::iter(sources)
         .map(|source| {
             let store = Arc::clone(store);
-            let target = works_dir.join(&source.name);
+            let outputs = Outputs::new(dir, &source.name);
             tokio::spawn(async move {
-                let outcome = with_retries(&store, &source, &target, min_year, max_year).await;
+                let outcome = with_retries(&store, &source, &outputs, min_year, max_year).await;
                 (source.name.clone(), outcome)
             })
         })
@@ -131,6 +141,8 @@ async fn extract_works(
                 summary.records += stats.records;
                 summary.works += stats.works;
                 summary.rows += stats.rows;
+                summary.topics += stats.topics;
+                summary.titles += stats.titles;
                 summary.bytes += stats.bytes;
                 fetched += bytes;
             }
@@ -164,18 +176,18 @@ async fn extract_works(
 async fn with_retries(
     store: &Arc<dyn ObjectStore>,
     source: &SourceFile,
-    target: &Path,
+    outputs: &Outputs,
     min_year: u16,
     max_year: u16,
 ) -> Result<(FileStats, u64)> {
-    if let Some(stats) = completed_stats(target, min_year, max_year)
+    if let Some(stats) = completed_stats(outputs, min_year, max_year)
         && stats.records == source.records
     {
         return Ok((stats, 0));
     }
     let mut attempt = 0;
     loop {
-        match extract_file(store, source, target, min_year, max_year).await {
+        match extract_file(store, source, outputs, min_year, max_year).await {
             Ok(stats) => return Ok((stats, source.size)),
             Err(error) if attempt < RETRIES => {
                 attempt += 1;

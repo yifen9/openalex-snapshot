@@ -14,11 +14,11 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::fs::File;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
-pub const WORK_LEAVES: [&str; 17] = [
+pub const WORK_LEAVES: [&str; 20] = [
     "id",
     "doi",
     "language",
@@ -36,6 +36,9 @@ pub const WORK_LEAVES: [&str; 17] = [
     "authorships.list.element.author.orcid",
     "authorships.list.element.author_position",
     "authorships.list.element.institutions.list.element.id",
+    "title",
+    "topics.list.element.id",
+    "topics.list.element.score",
 ];
 
 pub static ROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -62,20 +65,62 @@ pub static ROW_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-pub static ROW_COLUMNS: LazyLock<String> = LazyLock::new(|| {
-    ROW_SCHEMA
+pub static TOPIC_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("work_id", DataType::UInt64, false),
+        Field::new("rank", DataType::UInt8, false),
+        Field::new("topic_id", DataType::UInt16, false),
+        Field::new("score", DataType::Float32, false),
+    ]))
+});
+
+pub static TITLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("work_id", DataType::UInt64, false),
+        Field::new("title", DataType::Utf8, false),
+    ]))
+});
+
+fn names(schema: &SchemaRef) -> String {
+    schema
         .fields()
         .iter()
         .map(|field| field.name().as_str())
         .collect::<Vec<_>>()
         .join(",")
-});
+}
+
+pub static ROW_COLUMNS: LazyLock<String> = LazyLock::new(|| names(&ROW_SCHEMA));
+pub static TOPIC_COLUMNS: LazyLock<String> = LazyLock::new(|| names(&TOPIC_SCHEMA));
+pub static TITLE_COLUMNS: LazyLock<String> = LazyLock::new(|| names(&TITLE_SCHEMA));
+
+pub struct Outputs {
+    pub works: PathBuf,
+    pub topics: PathBuf,
+    pub titles: PathBuf,
+}
+
+impl Outputs {
+    pub fn new(dir: &Path, name: &str) -> Self {
+        Outputs {
+            works: dir.join("works").join(name),
+            topics: dir.join("topics").join(name),
+            titles: dir.join("titles").join(name),
+        }
+    }
+
+    fn all(&self) -> [&Path; 3] {
+        [&self.titles, &self.topics, &self.works]
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileStats {
     pub records: u64,
     pub works: u64,
     pub rows: u64,
+    pub topics: u64,
+    pub titles: u64,
     pub bytes: u64,
 }
 
@@ -112,6 +157,26 @@ struct RowColumns {
     orcid_id: StringBuilder,
 }
 
+#[derive(Default)]
+struct TopicColumns {
+    work: Vec<u64>,
+    rank: Vec<u8>,
+    topic: Vec<u16>,
+    score: Vec<f32>,
+}
+
+#[derive(Default)]
+struct TitleColumns {
+    work: Vec<u64>,
+    title: StringBuilder,
+}
+
+pub struct Batches {
+    pub rows: Option<RecordBatch>,
+    pub topics: Option<RecordBatch>,
+    pub titles: Option<RecordBatch>,
+}
+
 struct WorkColumns<'a> {
     id: &'a StringArray,
     doi: &'a StringArray,
@@ -133,12 +198,17 @@ struct WorkColumns<'a> {
     position: &'a StringArray,
     institutions: &'a ListArray,
     institution: &'a StringArray,
+    title: &'a StringArray,
+    topics: &'a ListArray,
+    topic: &'a StringArray,
+    score: &'a Float32Array,
 }
 
 impl<'a> WorkColumns<'a> {
     fn of(batch: &'a RecordBatch) -> Result<Self> {
         let authorships: &ListArray = column(batch, "authorships")?;
         let institutions: &ListArray = member(authorships.values(), "institutions")?;
+        let topics: &ListArray = column(batch, "topics")?;
         Ok(WorkColumns {
             id: column(batch, "id")?,
             doi: column(batch, "doi")?,
@@ -160,6 +230,10 @@ impl<'a> WorkColumns<'a> {
             position: member(authorships.values(), "author_position")?,
             institutions,
             institution: member(institutions.values(), "id")?,
+            title: column(batch, "title")?,
+            topics,
+            topic: member(topics.values(), "id")?,
+            score: member(topics.values(), "score")?,
         })
     }
 
@@ -200,6 +274,8 @@ pub struct Explode {
     slots: Vec<Slot>,
     ids: Vec<u64>,
     columns: RowColumns,
+    topics: TopicColumns,
+    titles: TitleColumns,
     pub stats: FileStats,
 }
 
@@ -210,11 +286,13 @@ impl Explode {
             slots: Vec::new(),
             ids: Vec::new(),
             columns: RowColumns::default(),
+            topics: TopicColumns::default(),
+            titles: TitleColumns::default(),
             stats: FileStats::default(),
         }
     }
 
-    pub fn push(&mut self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+    pub fn push(&mut self, batch: &RecordBatch) -> Result<Batches> {
         let works = WorkColumns::of(batch)?;
         for index in 0..batch.num_rows() {
             self.push_work(&works, index)?;
@@ -275,6 +353,15 @@ impl Explode {
         let (start, end) = (offsets[index] as usize, offsets[index + 1] as usize);
         self.collect_slots(works, start, end)?;
         self.stats.works += 1;
+        self.push_topics(works, index, work)?;
+        let top10 = works.flag(works.top10, index);
+        if top10 == Some(true)
+            && let Some(title) = optional(works.title, index)
+        {
+            self.titles.work.push(work);
+            self.titles.title.append_value(title);
+            self.stats.titles += 1;
+        }
         if self.slots.is_empty() {
             return Ok(());
         }
@@ -292,7 +379,6 @@ impl Explode {
             .fwci
             .is_valid(index)
             .then(|| works.fwci.value(index) as f32);
-        let top10 = works.flag(works.top10, index);
         let top1 = works.flag(works.top1, index);
         let authors = u16::try_from(end - start).unwrap_or(u16::MAX);
         let language = optional(works.language, index);
@@ -327,7 +413,71 @@ impl Explode {
         Ok(())
     }
 
-    fn finish_batch(&mut self) -> Result<Option<RecordBatch>> {
+    fn push_topics(&mut self, works: &WorkColumns, index: usize, work: u64) -> Result<()> {
+        if works.topics.is_null(index) {
+            return Ok(());
+        }
+        let offsets = works.topics.value_offsets();
+        let (start, end) = (offsets[index] as usize, offsets[index + 1] as usize);
+        let mut rank = 0u8;
+        for slot in start..end {
+            let Some(id) = optional(works.topic, slot) else {
+                continue;
+            };
+            if works.score.is_null(slot) {
+                continue;
+            }
+            self.topics.work.push(work);
+            self.topics.rank.push(rank);
+            self.topics.topic.push(parse_id(id)?);
+            self.topics.score.push(works.score.value(slot));
+            rank = rank.saturating_add(1);
+            self.stats.topics += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_batch(&mut self) -> Result<Batches> {
+        Ok(Batches {
+            rows: self.finish_rows()?,
+            topics: self.finish_topics()?,
+            titles: self.finish_titles()?,
+        })
+    }
+
+    fn finish_topics(&mut self) -> Result<Option<RecordBatch>> {
+        if self.topics.work.is_empty() {
+            return Ok(None);
+        }
+        let t = std::mem::take(&mut self.topics);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(t.work)),
+            Arc::new(UInt8Array::from(t.rank)),
+            Arc::new(UInt16Array::from(t.topic)),
+            Arc::new(Float32Array::from(t.score)),
+        ];
+        Ok(Some(RecordBatch::try_new(
+            Arc::clone(&TOPIC_SCHEMA),
+            arrays,
+        )?))
+    }
+
+    fn finish_titles(&mut self) -> Result<Option<RecordBatch>> {
+        if self.titles.work.is_empty() {
+            return Ok(None);
+        }
+        let t = std::mem::take(&mut self.titles);
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(t.work)),
+            Arc::new({ t.title }.finish()),
+        ];
+        Ok(Some(RecordBatch::try_new(
+            Arc::clone(&TITLE_SCHEMA),
+            arrays,
+        )?))
+    }
+
+    fn finish_rows(&mut self) -> Result<Option<RecordBatch>> {
         if self.columns.work.is_empty() {
             return Ok(None);
         }
@@ -357,44 +507,81 @@ impl Explode {
     }
 }
 
+fn temporary(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 pub async fn extract_file(
     store: &Arc<dyn ObjectStore>,
     source: &SourceFile,
-    target: &Path,
+    outputs: &Outputs,
     min_year: u16,
     max_year: u16,
 ) -> Result<FileStats> {
-    let mut temporary = target.as_os_str().to_os_string();
-    temporary.push(".tmp");
-    let temporary = Path::new(&temporary);
-    let written = write_file(store, source, temporary, min_year, max_year)
+    let written = write_file(store, source, outputs, min_year, max_year)
         .await
         .and_then(|stats| {
-            std::fs::rename(temporary, target)
-                .with_context(|| format!("renaming to {}", target.display()))?;
+            for path in outputs.all() {
+                std::fs::rename(temporary(path), path)
+                    .with_context(|| format!("renaming to {}", path.display()))?;
+            }
             Ok(stats)
         });
     if written.is_err() {
-        std::fs::remove_file(temporary).ok();
+        for path in outputs.all() {
+            std::fs::remove_file(temporary(path)).ok();
+        }
     }
     written.with_context(|| format!("extracting {}", source.location))
+}
+
+fn writer(path: &Path, schema: &SchemaRef) -> Result<ArrowWriter<File>> {
+    let temporary = temporary(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let file =
+        File::create(&temporary).with_context(|| format!("creating {}", temporary.display()))?;
+    Ok(ArrowWriter::try_new(
+        file,
+        Arc::clone(schema),
+        Some(zstd()),
+    )?)
+}
+
+fn close(mut writer: ArrowWriter<File>, columns: &str, count: u64) -> Result<u64> {
+    writer.append_key_value_metadata(KeyValue::new("columns".to_string(), columns.to_string()));
+    writer.append_key_value_metadata(KeyValue::new("count".to_string(), count.to_string()));
+    let file = writer.into_inner()?;
+    file.sync_all()?;
+    Ok(file.metadata()?.len())
 }
 
 async fn write_file(
     store: &Arc<dyn ObjectStore>,
     source: &SourceFile,
-    temporary: &Path,
+    outputs: &Outputs,
     min_year: u16,
     max_year: u16,
 ) -> Result<FileStats> {
     let mut stream = open(store, source, &WORK_LEAVES).await?;
-    let file =
-        File::create(temporary).with_context(|| format!("creating {}", temporary.display()))?;
-    let mut writer = ArrowWriter::try_new(file, Arc::clone(&ROW_SCHEMA), Some(zstd()))?;
+    let mut rows = writer(&outputs.works, &ROW_SCHEMA)?;
+    let mut topics = writer(&outputs.topics, &TOPIC_SCHEMA)?;
+    let mut titles = writer(&outputs.titles, &TITLE_SCHEMA)?;
     let mut explode = Explode::new(min_year, max_year);
     while let Some(batch) = stream.try_next().await? {
-        if let Some(rows) = explode.push(&batch)? {
-            writer.write(&rows)?;
+        let batches = explode.push(&batch)?;
+        if let Some(batch) = batches.rows {
+            rows.write(&batch)?;
+        }
+        if let Some(batch) = batches.topics {
+            topics.write(&batch)?;
+        }
+        if let Some(batch) = batches.titles {
+            titles.write(&batch)?;
         }
     }
     let mut stats = explode.stats;
@@ -409,41 +596,63 @@ async fn write_file(
         ("records", stats.records.to_string()),
         ("works", stats.works.to_string()),
         ("rows", stats.rows.to_string()),
+        ("topics", stats.topics.to_string()),
+        ("titles", stats.titles.to_string()),
         ("min_year", min_year.to_string()),
         ("max_year", max_year.to_string()),
-        ("columns", ROW_COLUMNS.clone()),
     ] {
-        writer.append_key_value_metadata(KeyValue::new(key.to_string(), value));
+        rows.append_key_value_metadata(KeyValue::new(key.to_string(), value));
     }
-    let file = writer.into_inner()?;
-    file.sync_all()?;
-    stats.bytes = file.metadata()?.len();
+    stats.bytes = close(titles, &TITLE_COLUMNS, stats.titles)?
+        + close(topics, &TOPIC_COLUMNS, stats.topics)?
+        + close(rows, &ROW_COLUMNS, stats.rows)?;
     Ok(stats)
 }
 
-pub fn completed_stats(path: &Path, min_year: u16, max_year: u16) -> Option<FileStats> {
+fn metadata(path: &Path) -> Option<(u64, Vec<KeyValue>)> {
     let file = File::open(path).ok()?;
     let bytes = file.metadata().ok()?.len();
     let reader = SerializedFileReader::new(file).ok()?;
-    let entries = reader.metadata().file_metadata().key_value_metadata()?;
-    let text = |key: &str| -> Option<&str> {
-        entries
-            .iter()
-            .find(|entry| entry.key == key)?
-            .value
-            .as_deref()
-    };
-    let value = |key: &str| -> Option<u64> { text(key)?.parse().ok() };
-    let complete = text("columns")? == ROW_COLUMNS.as_str()
-        && value("min_year")? == u64::from(min_year)
-        && value("max_year")? == u64::from(max_year);
+    let entries = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()?
+        .clone();
+    Some((bytes, entries))
+}
+
+fn entry<'a>(entries: &'a [KeyValue], key: &str) -> Option<&'a str> {
+    entries
+        .iter()
+        .find(|entry| entry.key == key)?
+        .value
+        .as_deref()
+}
+
+fn number(entries: &[KeyValue], key: &str) -> Option<u64> {
+    entry(entries, key)?.parse().ok()
+}
+
+pub fn completed_stats(outputs: &Outputs, min_year: u16, max_year: u16) -> Option<FileStats> {
+    let (works_bytes, works) = metadata(&outputs.works)?;
+    let (topics_bytes, topics) = metadata(&outputs.topics)?;
+    let (titles_bytes, titles) = metadata(&outputs.titles)?;
+    let complete = entry(&works, "columns")? == ROW_COLUMNS.as_str()
+        && entry(&topics, "columns")? == TOPIC_COLUMNS.as_str()
+        && entry(&titles, "columns")? == TITLE_COLUMNS.as_str()
+        && number(&works, "min_year")? == u64::from(min_year)
+        && number(&works, "max_year")? == u64::from(max_year)
+        && number(&works, "topics")? == number(&topics, "count")?
+        && number(&works, "titles")? == number(&titles, "count")?;
     if !complete {
         return None;
     }
     Some(FileStats {
-        records: value("records")?,
-        works: value("works")?,
-        rows: value("rows")?,
-        bytes,
+        records: number(&works, "records")?,
+        works: number(&works, "works")?,
+        rows: number(&works, "rows")?,
+        topics: number(&works, "topics")?,
+        titles: number(&works, "titles")?,
+        bytes: works_bytes + topics_bytes + titles_bytes,
     })
 }

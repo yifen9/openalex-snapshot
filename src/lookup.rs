@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub type Leaf = (&'static str, &'static str);
+
+const IDS: [&str; 3] = ["subfield_id", "field_id", "domain_id"];
 type Record = (u64, Vec<Option<String>>);
 
 pub async fn extract_lookup(
@@ -47,23 +49,24 @@ pub async fn extract_lookup(
         );
     }
     let mut fields = vec![Field::new("id", DataType::UInt64, false)];
-    fields.extend(
-        leaves[1..]
-            .iter()
-            .map(|(_, name)| Field::new(*name, DataType::Utf8, true)),
-    );
-    let schema = Arc::new(Schema::new(fields));
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(
         records.iter().map(|r| r.0).collect::<UInt64Array>(),
     )];
-    for slot in 0..leaves.len() - 1 {
-        arrays.push(Arc::new(
-            records
-                .iter()
-                .map(|r| r.1[slot].as_deref())
-                .collect::<StringArray>(),
-        ));
+    for (slot, (_, name)) in leaves[1..].iter().enumerate() {
+        let values = records.iter().map(|r| r.1[slot].as_deref());
+        if IDS.contains(name) {
+            fields.push(Field::new(*name, DataType::UInt64, true));
+            arrays.push(Arc::new(
+                values
+                    .map(|value| value.map(parse_id::<u64>).transpose())
+                    .collect::<Result<UInt64Array>>()?,
+            ));
+        } else {
+            fields.push(Field::new(*name, DataType::Utf8, true));
+            arrays.push(Arc::new(values.collect::<StringArray>()));
+        }
     }
+    let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)?;
     write_atomic(target, |w| {
         let mut writer = ArrowWriter::try_new(w, schema, Some(zstd()))?;
