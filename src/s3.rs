@@ -44,6 +44,18 @@ pub struct SourceFile {
     pub records: u64,
 }
 
+impl SourceFile {
+    pub fn check_records(&self, read: u64) -> Result<()> {
+        if read != self.records {
+            bail!(
+                "read {read} records but the manifest lists {}",
+                self.records
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         serde_json::from_slice(bytes).context("parsing the snapshot manifest")

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::index::{completed_index, index_file};
 use crate::io::{write_atomic, write_json};
 use crate::lookup::{Leaf, extract_lookup};
 use crate::s3::{SourceFile, manifest, store};
@@ -55,6 +56,11 @@ const LOOKUPS: [(&str, &[Leaf]); 6] = [
     ),
 ];
 
+trait Summary: Default + Serialize {
+    const NAME: &'static str;
+    fn add(&mut self, stats: &FileStats);
+}
+
 #[derive(Debug, Default, Serialize)]
 struct WorksSummary {
     files: u64,
@@ -66,19 +72,56 @@ struct WorksSummary {
     bytes: u64,
 }
 
-pub fn run(config: &Config) -> Result<()> {
+impl Summary for WorksSummary {
+    const NAME: &'static str = "works";
+
+    fn add(&mut self, stats: &FileStats) {
+        self.files += 1;
+        self.records += stats.records;
+        self.works += stats.works;
+        self.rows += stats.rows;
+        self.topics += stats.topics;
+        self.titles += stats.titles;
+        self.bytes += stats.bytes;
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct IndexSummary {
+    files: u64,
+    records: u64,
+    works: u64,
+    bytes: u64,
+}
+
+impl Summary for IndexSummary {
+    const NAME: &'static str = "index";
+
+    fn add(&mut self, stats: &FileStats) {
+        self.files += 1;
+        self.records += stats.records;
+        self.works += stats.works;
+        self.bytes += stats.bytes;
+    }
+}
+
+pub fn run(config: &Config, index: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(extract(config))
+    runtime.block_on(extract(config, index))
 }
 
-async fn extract(config: &Config) -> Result<()> {
+async fn extract(config: &Config, index: bool) -> Result<()> {
     let snapshot = &config.snapshot;
     let store = store(snapshot)?;
     let (bytes, manifest) = manifest(&store, snapshot).await?;
     let dir = config.snapshot_dir();
     keep_manifest(&dir.join("manifest.json"), &bytes)?;
+    let works = manifest.sources("works", &snapshot.bucket)?;
+    if index {
+        return extract_index(&store, works, &dir, config).await;
+    }
     for (entity, leaves) in LOOKUPS {
         extract_lookup(
             &store,
@@ -89,13 +132,7 @@ async fn extract(config: &Config) -> Result<()> {
         )
         .await?;
     }
-    extract_works(
-        &store,
-        manifest.sources("works", &snapshot.bucket)?,
-        &dir,
-        config,
-    )
-    .await
+    extract_works(&store, works, &dir, config).await
 }
 
 fn keep_manifest(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -116,34 +153,69 @@ async fn extract_works(
     config: &Config,
 ) -> Result<()> {
     let (min_year, max_year) = (config.corpus.min_year, config.corpus.max_year);
-    let concurrency = config.snapshot.concurrency;
+    extract_files::<WorksSummary, _>(sources, dir, config.snapshot.concurrency, |source| {
+        let store = Arc::clone(store);
+        let outputs = Outputs::new(dir, &source.name);
+        async move {
+            let completed = completed_stats(&outputs, min_year, max_year);
+            with_retries(&source, completed, || {
+                extract_file(&store, &source, &outputs, min_year, max_year)
+            })
+            .await
+        }
+    })
+    .await
+}
+
+async fn extract_index(
+    store: &Arc<dyn ObjectStore>,
+    sources: Vec<SourceFile>,
+    dir: &Path,
+    config: &Config,
+) -> Result<()> {
+    let (min_year, max_year) = (config.corpus.min_year, config.corpus.max_year);
+    extract_files::<IndexSummary, _>(sources, dir, config.snapshot.concurrency, |source| {
+        let store = Arc::clone(store);
+        let path = dir.join("index").join(&source.name);
+        async move {
+            let completed = completed_index(&path, min_year, max_year);
+            with_retries(&source, completed, || {
+                index_file(&store, &source, &path, min_year, max_year)
+            })
+            .await
+        }
+    })
+    .await
+}
+
+async fn extract_files<S: Summary, F>(
+    sources: Vec<SourceFile>,
+    dir: &Path,
+    concurrency: usize,
+    mut task: impl FnMut(SourceFile) -> F,
+) -> Result<()>
+where
+    F: Future<Output = Result<(FileStats, u64)>> + Send + 'static,
+{
     let total = sources.len();
     let started = Instant::now();
     let mut tasks = futures::stream::iter(sources)
         .map(|source| {
-            let store = Arc::clone(store);
-            let outputs = Outputs::new(dir, &source.name);
-            tokio::spawn(async move {
-                let outcome = with_retries(&store, &source, &outputs, min_year, max_year).await;
-                (source.name.clone(), outcome)
-            })
+            let name = source.name.clone();
+            let handle = tokio::spawn(task(source));
+            async move { (name, handle.await) }
         })
         .buffer_unordered(concurrency);
-    let mut summary = WorksSummary::default();
+    let mut summary = S::default();
+    let mut rows = 0u64;
     let mut fetched = 0u64;
     let mut failed = Vec::new();
     let mut done = 0usize;
-    while let Some(joined) = tasks.next().await {
-        let (name, outcome) = joined?;
-        match outcome {
+    while let Some((name, joined)) = tasks.next().await {
+        match joined? {
             Ok((stats, bytes)) => {
-                summary.files += 1;
-                summary.records += stats.records;
-                summary.works += stats.works;
-                summary.rows += stats.rows;
-                summary.topics += stats.topics;
-                summary.titles += stats.titles;
-                summary.bytes += stats.bytes;
+                summary.add(&stats);
+                rows += stats.rows;
                 fetched += bytes;
             }
             Err(error) => {
@@ -155,39 +227,41 @@ async fn extract_works(
         if done.is_multiple_of(concurrency) || done == total {
             let elapsed = started.elapsed().as_secs_f64();
             eprintln!(
-                "works {done}/{total} files, {} rows, {elapsed:.0}s, {:.1} MB/s",
-                summary.rows,
+                "{} {done}/{total} files, {rows} rows, {elapsed:.0}s, {:.1} MB/s",
+                S::NAME,
                 fetched as f64 / 1e6 / elapsed.max(1e-9)
             );
         }
     }
-    write_json(&dir.join("works-summary.json"), &summary)?;
+    write_json(&dir.join(format!("{}-summary.json", S::NAME)), &summary)?;
     if !failed.is_empty() {
         failed.sort();
         bail!(
-            "{} of {total} works files failed, rerun to resume: {}",
+            "{} of {total} {} files failed, rerun to resume: {}",
             failed.len(),
+            S::NAME,
             failed.join(", ")
         );
     }
     Ok(())
 }
 
-async fn with_retries(
-    store: &Arc<dyn ObjectStore>,
+async fn with_retries<F>(
     source: &SourceFile,
-    outputs: &Outputs,
-    min_year: u16,
-    max_year: u16,
-) -> Result<(FileStats, u64)> {
-    if let Some(stats) = completed_stats(outputs, min_year, max_year)
+    completed: Option<FileStats>,
+    mut extract: impl FnMut() -> F,
+) -> Result<(FileStats, u64)>
+where
+    F: Future<Output = Result<FileStats>>,
+{
+    if let Some(stats) = completed
         && stats.records == source.records
     {
         return Ok((stats, 0));
     }
     let mut attempt = 0;
     loop {
-        match extract_file(store, source, outputs, min_year, max_year).await {
+        match extract().await {
             Ok(stats) => return Ok((stats, source.size)),
             Err(error) if attempt < RETRIES => {
                 attempt += 1;

@@ -1,6 +1,6 @@
 use crate::io::zstd;
 use crate::s3::{SourceFile, column, member, open, optional, parse_id};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, ListArray, RecordBatch,
@@ -81,7 +81,7 @@ pub static TITLE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-fn names(schema: &SchemaRef) -> String {
+pub fn names(schema: &SchemaRef) -> String {
     schema
         .fields()
         .iter()
@@ -260,6 +260,16 @@ pub fn bare_doi(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+pub fn years(min_year: u16, max_year: u16) -> Range<i32> {
+    i32::from(min_year)..i32::from(max_year) + 1
+}
+
+pub fn kept(years: &Range<i32>, xpac: &BooleanArray, year: &Int32Array, index: usize) -> bool {
+    !(xpac.is_valid(index) && xpac.value(index))
+        && year.is_valid(index)
+        && years.contains(&year.value(index))
+}
+
 fn position_code(value: Option<&str>) -> u8 {
     match value {
         Some("first") => 0,
@@ -282,7 +292,7 @@ pub struct Explode {
 impl Explode {
     pub fn new(min_year: u16, max_year: u16) -> Self {
         Explode {
-            years: i32::from(min_year)..i32::from(max_year) + 1,
+            years: years(min_year, max_year),
             slots: Vec::new(),
             ids: Vec::new(),
             columns: RowColumns::default(),
@@ -342,10 +352,7 @@ impl Explode {
     }
 
     fn push_work(&mut self, works: &WorkColumns, index: usize) -> Result<()> {
-        if works.xpac.is_valid(index) && works.xpac.value(index) {
-            return Ok(());
-        }
-        if works.year.is_null(index) || !self.years.contains(&works.year.value(index)) {
+        if !kept(&self.years, works.xpac, works.year, index) {
             return Ok(());
         }
         let work: u64 = parse_id(optional(works.id, index).context("work without id")?)?;
@@ -585,13 +592,7 @@ async fn write_file(
         }
     }
     let mut stats = explode.stats;
-    if stats.records != source.records {
-        bail!(
-            "read {} records but the manifest lists {}",
-            stats.records,
-            source.records
-        );
-    }
+    source.check_records(stats.records)?;
     for (key, value) in [
         ("records", stats.records.to_string()),
         ("works", stats.works.to_string()),
@@ -609,7 +610,7 @@ async fn write_file(
     Ok(stats)
 }
 
-fn metadata(path: &Path) -> Option<(u64, Vec<KeyValue>)> {
+pub fn metadata(path: &Path) -> Option<(u64, Vec<KeyValue>)> {
     let file = File::open(path).ok()?;
     let bytes = file.metadata().ok()?.len();
     let reader = SerializedFileReader::new(file).ok()?;
@@ -621,7 +622,7 @@ fn metadata(path: &Path) -> Option<(u64, Vec<KeyValue>)> {
     Some((bytes, entries))
 }
 
-fn entry<'a>(entries: &'a [KeyValue], key: &str) -> Option<&'a str> {
+pub fn entry<'a>(entries: &'a [KeyValue], key: &str) -> Option<&'a str> {
     entries
         .iter()
         .find(|entry| entry.key == key)?
@@ -629,7 +630,7 @@ fn entry<'a>(entries: &'a [KeyValue], key: &str) -> Option<&'a str> {
         .as_deref()
 }
 
-fn number(entries: &[KeyValue], key: &str) -> Option<u64> {
+pub fn number(entries: &[KeyValue], key: &str) -> Option<u64> {
     entry(entries, key)?.parse().ok()
 }
 

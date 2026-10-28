@@ -150,12 +150,6 @@ async fn read_source(
             ));
         }
     }
-    if records.len() as u64 != source.records {
-        bail!(
-            "read {} records but the manifest lists {}",
-            records.len(),
-            source.records
-        );
-    }
+    source.check_records(records.len() as u64)?;
     Ok(records)
 }

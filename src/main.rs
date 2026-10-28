@@ -1,5 +1,6 @@
 mod config;
 mod extract;
+mod index;
 mod io;
 mod lookup;
 mod s3;
@@ -20,9 +21,11 @@ struct Args {
     config: PathBuf,
     #[arg(long)]
     release: Option<String>,
+    #[arg(long)]
+    index: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    extract::run(&Config::load(&args.config, args.release)?)
+    extract::run(&Config::load(&args.config, args.release)?, args.index)
 }
