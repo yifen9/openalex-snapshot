@@ -1,3 +1,4 @@
+use crate::awards::{award_file, completed_awards};
 use crate::config::Config;
 use crate::index::{completed_index, index_file};
 use crate::io::{write_atomic, write_json};
@@ -14,6 +15,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const RETRIES: u32 = 3;
+const FUNDERS: &[Leaf] = &[
+    ("id", "id"),
+    ("display_name", "display_name"),
+    ("country_code", "country_code"),
+];
 const LOOKUPS: [(&str, &[Leaf]); 6] = [
     (
         "institutions",
@@ -105,14 +111,35 @@ impl Summary for IndexSummary {
     }
 }
 
-pub fn run(config: &Config, index: bool) -> Result<()> {
+#[derive(Debug, Default, Serialize)]
+struct AwardsSummary {
+    files: u64,
+    records: u64,
+    awards: u64,
+    works: u64,
+    bytes: u64,
+}
+
+impl Summary for AwardsSummary {
+    const NAME: &'static str = "awards";
+
+    fn add(&mut self, stats: &FileStats) {
+        self.files += 1;
+        self.records += stats.records;
+        self.awards += stats.rows;
+        self.works += stats.works;
+        self.bytes += stats.bytes;
+    }
+}
+
+pub fn run(config: &Config, index: bool, awards: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(extract(config, index))
+    runtime.block_on(extract(config, index, awards))
 }
 
-async fn extract(config: &Config, index: bool) -> Result<()> {
+async fn extract(config: &Config, index: bool, awards: bool) -> Result<()> {
     let snapshot = &config.snapshot;
     let store = store(snapshot)?;
     let (bytes, manifest) = manifest(&store, snapshot).await?;
@@ -121,6 +148,18 @@ async fn extract(config: &Config, index: bool) -> Result<()> {
     let works = manifest.sources("works", &snapshot.bucket)?;
     if index {
         return extract_index(&store, works, &dir, config).await;
+    }
+    if awards {
+        extract_lookup(
+            &store,
+            manifest.sources("funders", &snapshot.bucket)?,
+            FUNDERS,
+            &dir.join("funders.parquet"),
+            snapshot.concurrency,
+        )
+        .await?;
+        let sources = manifest.sources("awards", &snapshot.bucket)?;
+        return extract_awards(&store, sources, &dir, config.snapshot.concurrency).await;
     }
     for (entity, leaves) in LOOKUPS {
         extract_lookup(
@@ -183,6 +222,23 @@ async fn extract_index(
                 index_file(&store, &source, &path, min_year, max_year)
             })
             .await
+        }
+    })
+    .await
+}
+
+async fn extract_awards(
+    store: &Arc<dyn ObjectStore>,
+    sources: Vec<SourceFile>,
+    dir: &Path,
+    concurrency: usize,
+) -> Result<()> {
+    extract_files::<AwardsSummary, _>(sources, dir, concurrency, |source| {
+        let store = Arc::clone(store);
+        let path = dir.join("awards").join(&source.name);
+        async move {
+            let completed = completed_awards(&path);
+            with_retries(&source, completed, || award_file(&store, &source, &path)).await
         }
     })
     .await

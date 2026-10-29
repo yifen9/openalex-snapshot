@@ -1,3 +1,4 @@
+mod awards;
 mod config;
 mod extract;
 mod index;
@@ -23,9 +24,15 @@ struct Args {
     release: Option<String>,
     #[arg(long)]
     index: bool,
+    #[arg(long)]
+    awards: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    extract::run(&Config::load(&args.config, args.release)?, args.index)
+    extract::run(
+        &Config::load(&args.config, args.release)?,
+        args.index,
+        args.awards,
+    )
 }
