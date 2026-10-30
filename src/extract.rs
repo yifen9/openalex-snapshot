@@ -2,6 +2,7 @@ use crate::awards::{award_file, completed_awards};
 use crate::config::Config;
 use crate::index::{completed_index, index_file};
 use crate::io::{write_atomic, write_json};
+use crate::links::{LinkOutputs, completed_links, link_file};
 use crate::lookup::{Leaf, extract_lookup};
 use crate::s3::{SourceFile, manifest, store};
 use crate::works::{FileStats, Outputs, completed_stats, extract_file};
@@ -42,6 +43,14 @@ const LOOKUPS: [(&str, &[Leaf]); 6] = [
             ("display_name", "display_name"),
             ("type", "type"),
             ("country_code", "country_code"),
+            ("issn_l", "issn_l"),
+            ("issn.list.element", "issn"),
+            ("is_core", "is_core"),
+            ("is_oa", "is_oa"),
+            ("is_in_doaj", "is_in_doaj"),
+            ("is_preprint_repository", "is_preprint_repository"),
+            ("ids.wikidata", "wikidata"),
+            ("homepage_url", "homepage_url"),
         ],
     ),
     ("fields", &[("id", "id"), ("display_name", "display_name")]),
@@ -120,6 +129,27 @@ struct AwardsSummary {
     bytes: u64,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct LinksSummary {
+    files: u64,
+    records: u64,
+    works: u64,
+    references: u64,
+    bytes: u64,
+}
+
+impl Summary for LinksSummary {
+    const NAME: &'static str = "links";
+
+    fn add(&mut self, stats: &FileStats) {
+        self.files += 1;
+        self.records += stats.records;
+        self.works += stats.works;
+        self.references += stats.rows;
+        self.bytes += stats.bytes;
+    }
+}
+
 impl Summary for AwardsSummary {
     const NAME: &'static str = "awards";
 
@@ -132,20 +162,33 @@ impl Summary for AwardsSummary {
     }
 }
 
-pub fn run(config: &Config, index: bool, awards: bool) -> Result<()> {
+pub fn run(config: &Config, index: bool, awards: bool, links: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(extract(config, index, awards))
+    runtime.block_on(extract(config, index, awards, links))
 }
 
-async fn extract(config: &Config, index: bool, awards: bool) -> Result<()> {
+async fn extract(config: &Config, index: bool, awards: bool, links: bool) -> Result<()> {
     let snapshot = &config.snapshot;
     let store = store(snapshot)?;
     let (bytes, manifest) = manifest(&store, snapshot).await?;
     let dir = config.snapshot_dir();
     keep_manifest(&dir.join("manifest.json"), &bytes)?;
+    for (entity, leaves) in LOOKUPS {
+        extract_lookup(
+            &store,
+            manifest.sources(entity, &snapshot.bucket)?,
+            leaves,
+            &dir.join(format!("{entity}.parquet")),
+            snapshot.concurrency,
+        )
+        .await?;
+    }
     let works = manifest.sources("works", &snapshot.bucket)?;
+    if links {
+        return extract_links(&store, works, &dir, config).await;
+    }
     if index {
         return extract_index(&store, works, &dir, config).await;
     }
@@ -160,16 +203,6 @@ async fn extract(config: &Config, index: bool, awards: bool) -> Result<()> {
         .await?;
         let sources = manifest.sources("awards", &snapshot.bucket)?;
         return extract_awards(&store, sources, &dir, config.snapshot.concurrency).await;
-    }
-    for (entity, leaves) in LOOKUPS {
-        extract_lookup(
-            &store,
-            manifest.sources(entity, &snapshot.bucket)?,
-            leaves,
-            &dir.join(format!("{entity}.parquet")),
-            snapshot.concurrency,
-        )
-        .await?;
     }
     extract_works(&store, works, &dir, config).await
 }
@@ -220,6 +253,27 @@ async fn extract_index(
             let completed = completed_index(&path, min_year, max_year);
             with_retries(&source, completed, || {
                 index_file(&store, &source, &path, min_year, max_year)
+            })
+            .await
+        }
+    })
+    .await
+}
+
+async fn extract_links(
+    store: &Arc<dyn ObjectStore>,
+    sources: Vec<SourceFile>,
+    dir: &Path,
+    config: &Config,
+) -> Result<()> {
+    let (min_year, max_year) = (config.corpus.min_year, config.corpus.max_year);
+    extract_files::<LinksSummary, _>(sources, dir, config.snapshot.concurrency, |source| {
+        let store = Arc::clone(store);
+        let outputs = LinkOutputs::new(dir, &source.name);
+        async move {
+            let completed = completed_links(&outputs, min_year, max_year);
+            with_retries(&source, completed, || {
+                link_file(&store, &source, &outputs, min_year, max_year)
             })
             .await
         }

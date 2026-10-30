@@ -3,6 +3,7 @@ mod config;
 mod extract;
 mod index;
 mod io;
+mod links;
 mod lookup;
 mod s3;
 mod works;
@@ -26,6 +27,8 @@ struct Args {
     index: bool,
     #[arg(long)]
     awards: bool,
+    #[arg(long)]
+    links: bool,
 }
 
 fn main() -> Result<()> {
@@ -34,5 +37,6 @@ fn main() -> Result<()> {
         &Config::load(&args.config, args.release)?,
         args.index,
         args.awards,
+        args.links,
     )
 }

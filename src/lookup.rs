@@ -2,18 +2,22 @@ use crate::io::{write_atomic, zstd};
 use crate::s3::{SourceFile, open, optional, parse_id, typed};
 use anyhow::{Context, Result, bail};
 use arrow_array::{
-    Array, ArrayRef, Float64Array, ListArray, RecordBatch, StringArray, StructArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, ListArray, RecordBatch, StringArray, StructArray,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
 pub type Leaf = (&'static str, &'static str);
 
 const IDS: [&str; 3] = ["subfield_id", "field_id", "domain_id"];
+const FLAGS: [&str; 4] = ["is_core", "is_oa", "is_in_doaj", "is_preprint_repository"];
 type Record = (u64, Vec<Option<String>>);
 
 pub async fn extract_lookup(
@@ -23,7 +27,7 @@ pub async fn extract_lookup(
     target: &Path,
     concurrency: usize,
 ) -> Result<()> {
-    if target.exists() {
+    if current(target, leaves) {
         return Ok(());
     }
     let parts: Vec<Vec<Record>> = futures::stream::iter(sources)
@@ -54,7 +58,14 @@ pub async fn extract_lookup(
     )];
     for (slot, (_, name)) in leaves[1..].iter().enumerate() {
         let values = records.iter().map(|r| r.1[slot].as_deref());
-        if IDS.contains(name) {
+        if FLAGS.contains(name) {
+            fields.push(Field::new(*name, DataType::Boolean, true));
+            arrays.push(Arc::new(
+                values
+                    .map(|value| value.map(|value| value == "true"))
+                    .collect::<BooleanArray>(),
+            ));
+        } else if IDS.contains(name) {
             fields.push(Field::new(*name, DataType::UInt64, true));
             arrays.push(Arc::new(
                 values
@@ -73,6 +84,20 @@ pub async fn extract_lookup(
         writer.write(&batch)?;
         writer.close()?;
         Ok(())
+    })
+}
+
+fn current(target: &Path, leaves: &[Leaf]) -> bool {
+    let Ok(file) = File::open(target) else {
+        return false;
+    };
+    ParquetRecordBatchReaderBuilder::try_new(file).is_ok_and(|reader| {
+        reader
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .eq(std::iter::once("id").chain(leaves[1..].iter().map(|(_, name)| *name)))
     })
 }
 
@@ -103,6 +128,11 @@ fn texts(batch: &RecordBatch, leaf: &str) -> Result<Vec<Option<String>>> {
         DataType::Utf8 => {
             let values: &StringArray = typed(array.as_ref(), leaf)?;
             rows.map(|i| optional(values, i).map(str::to_string))
+                .collect()
+        }
+        DataType::Boolean => {
+            let values: &BooleanArray = typed(array.as_ref(), leaf)?;
+            rows.map(|i| values.is_valid(i).then(|| values.value(i).to_string()))
                 .collect()
         }
         DataType::Float64 => {

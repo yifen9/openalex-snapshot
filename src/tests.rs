@@ -1,9 +1,13 @@
 use crate::index::index_rows;
+use crate::links::Links;
 use crate::s3::{Manifest, column, parse_id};
 use crate::works::{bare_doi, bare_orcid, years};
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
-    ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, UInt16Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray, UInt16Array,
+    UInt64Array,
 };
+use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
 #[test]
@@ -100,4 +104,53 @@ fn index_keeps_non_xpac_works_within_the_year_bounds() {
         dois.iter().collect::<Vec<_>>(),
         [Some("10.1/a"), None, Some("10.1/g")]
     );
+}
+
+#[test]
+fn links_sort_references_and_keep_the_index_works() {
+    let mut references = ListBuilder::new(StringBuilder::new());
+    for list in [vec!["W9", "W3"], vec!["W5"], vec![]] {
+        for target in list {
+            references.values().append_value(target);
+        }
+        references.append(true);
+    }
+    let source = StructArray::from(vec![(
+        Arc::new(Field::new("id", DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec![Some("S7"), Some("S8"), None])) as ArrayRef,
+    )]);
+    let location = StructArray::from(vec![(
+        Arc::new(Field::new("source", source.data_type().clone(), true)),
+        Arc::new(source) as ArrayRef,
+    )]);
+    let columns: [(&str, ArrayRef); 7] = [
+        ("id", Arc::new(StringArray::from(vec!["W2", "W1", "W4"]))),
+        (
+            "publication_year",
+            Arc::new(Int32Array::from(vec![2000, 1980, 2001])),
+        ),
+        ("is_xpac", Arc::new(BooleanArray::from(vec![false; 3]))),
+        ("referenced_works", Arc::new(references.finish())),
+        ("primary_location", Arc::new(location)),
+        (
+            "is_retracted",
+            Arc::new(BooleanArray::from(vec![Some(true), None, None])),
+        ),
+        ("is_paratext", Arc::new(BooleanArray::from(vec![false; 3]))),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).unwrap_or_else(|e| panic!("{e}"));
+    let mut links = Links::default();
+    links
+        .push(&batch, &years(1990, 2025))
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    let (pairs, sources) = links.finish().unwrap_or_else(|e| panic!("{e:#}"));
+    let citing: &UInt64Array = column(&pairs, "work_id").unwrap_or_else(|e| panic!("{e:#}"));
+    let cited: &UInt64Array =
+        column(&pairs, "referenced_work_id").unwrap_or_else(|e| panic!("{e:#}"));
+    let works: &UInt64Array = column(&sources, "work_id").unwrap_or_else(|e| panic!("{e:#}"));
+    let venues: &UInt64Array = column(&sources, "source_id").unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(citing.values().to_vec(), [2, 2]);
+    assert_eq!(cited.values().to_vec(), [3, 9]);
+    assert_eq!(works.values().to_vec(), [2, 4]);
+    assert_eq!(venues.iter().collect::<Vec<_>>(), [Some(7), None]);
 }
