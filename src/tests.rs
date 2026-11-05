@@ -1,3 +1,4 @@
+use crate::authors::author_rows;
 use crate::index::index_rows;
 use crate::links::Links;
 use crate::s3::{Manifest, column, parse_id};
@@ -5,7 +6,7 @@ use crate::works::{bare_doi, bare_orcid, years};
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray, UInt16Array,
-    UInt64Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
@@ -153,4 +154,50 @@ fn links_sort_references_and_keep_the_index_works() {
     assert_eq!(cited.values().to_vec(), [3, 9]);
     assert_eq!(works.values().to_vec(), [2, 4]);
     assert_eq!(venues.iter().collect::<Vec<_>>(), [Some(7), None]);
+}
+
+#[test]
+fn authors_keep_every_record_with_its_bare_uppercase_orcid() {
+    let columns: [(&str, ArrayRef); 4] = [
+        (
+            "id",
+            Arc::new(StringArray::from(vec![
+                "https://openalex.org/A5023888391",
+                "https://openalex.org/A9",
+                "https://openalex.org/A7",
+            ])),
+        ),
+        (
+            "display_name",
+            Arc::new(StringArray::from(vec![Some("Ada"), Some("Bo"), None])),
+        ),
+        (
+            "orcid",
+            Arc::new(StringArray::from(vec![
+                Some("https://orcid.org/0000-0002-1694-233x"),
+                Some(""),
+                None,
+            ])),
+        ),
+        (
+            "works_count",
+            Arc::new(Int32Array::from(vec![Some(12), Some(0), None])),
+        ),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).unwrap_or_else(|e| panic!("{e}"));
+    let rows = author_rows(&batch).unwrap_or_else(|e| panic!("{e:#}"));
+    let ids: &UInt64Array = column(&rows, "id").unwrap_or_else(|e| panic!("{e:#}"));
+    let orcids: &StringArray = column(&rows, "orcid_id").unwrap_or_else(|e| panic!("{e:#}"));
+    let names: &StringArray = column(&rows, "display_name").unwrap_or_else(|e| panic!("{e:#}"));
+    let counts: &UInt32Array = column(&rows, "works_count").unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(ids.values().to_vec(), [5023888391, 9, 7]);
+    assert_eq!(
+        orcids.iter().collect::<Vec<_>>(),
+        [Some("0000-0002-1694-233X"), None, None]
+    );
+    assert_eq!(
+        names.iter().collect::<Vec<_>>(),
+        [Some("Ada"), Some("Bo"), None]
+    );
+    assert_eq!(counts.iter().collect::<Vec<_>>(), [Some(12), Some(0), None]);
 }

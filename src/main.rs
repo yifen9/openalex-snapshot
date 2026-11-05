@@ -1,3 +1,4 @@
+mod authors;
 mod awards;
 mod config;
 mod extract;
@@ -29,6 +30,8 @@ struct Args {
     awards: bool,
     #[arg(long)]
     links: bool,
+    #[arg(long)]
+    authors: bool,
 }
 
 fn main() -> Result<()> {
@@ -38,5 +41,6 @@ fn main() -> Result<()> {
         args.index,
         args.awards,
         args.links,
+        args.authors,
     )
 }

@@ -121,6 +121,7 @@ pub struct FileStats {
     pub rows: u64,
     pub topics: u64,
     pub titles: u64,
+    pub orcids: u64,
     pub bytes: u64,
 }
 
@@ -655,5 +656,6 @@ pub fn completed_stats(outputs: &Outputs, min_year: u16, max_year: u16) -> Optio
         topics: number(&works, "topics")?,
         titles: number(&works, "titles")?,
         bytes: works_bytes + topics_bytes + titles_bytes,
+        ..FileStats::default()
     })
 }

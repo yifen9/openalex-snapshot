@@ -1,3 +1,4 @@
+use crate::authors::{author_file, completed_authors};
 use crate::awards::{award_file, completed_awards};
 use crate::config::Config;
 use crate::index::{completed_index, index_file};
@@ -162,14 +163,41 @@ impl Summary for AwardsSummary {
     }
 }
 
-pub fn run(config: &Config, index: bool, awards: bool, links: bool) -> Result<()> {
+#[derive(Debug, Default, Serialize)]
+struct AuthorsSummary {
+    files: u64,
+    records: u64,
+    authors: u64,
+    orcids: u64,
+    bytes: u64,
+}
+
+impl Summary for AuthorsSummary {
+    const NAME: &'static str = "authors";
+
+    fn add(&mut self, stats: &FileStats) {
+        self.files += 1;
+        self.records += stats.records;
+        self.authors += stats.rows;
+        self.orcids += stats.orcids;
+        self.bytes += stats.bytes;
+    }
+}
+
+pub fn run(config: &Config, index: bool, awards: bool, links: bool, authors: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(extract(config, index, awards, links))
+    runtime.block_on(extract(config, index, awards, links, authors))
 }
 
-async fn extract(config: &Config, index: bool, awards: bool, links: bool) -> Result<()> {
+async fn extract(
+    config: &Config,
+    index: bool,
+    awards: bool,
+    links: bool,
+    authors: bool,
+) -> Result<()> {
     let snapshot = &config.snapshot;
     let store = store(snapshot)?;
     let (bytes, manifest) = manifest(&store, snapshot).await?;
@@ -203,6 +231,10 @@ async fn extract(config: &Config, index: bool, awards: bool, links: bool) -> Res
         .await?;
         let sources = manifest.sources("awards", &snapshot.bucket)?;
         return extract_awards(&store, sources, &dir, config.snapshot.concurrency).await;
+    }
+    if authors {
+        let sources = manifest.sources("authors", &snapshot.bucket)?;
+        return extract_authors(&store, sources, &dir, snapshot.concurrency).await;
     }
     extract_works(&store, works, &dir, config).await
 }
@@ -293,6 +325,23 @@ async fn extract_awards(
         async move {
             let completed = completed_awards(&path);
             with_retries(&source, completed, || award_file(&store, &source, &path)).await
+        }
+    })
+    .await
+}
+
+async fn extract_authors(
+    store: &Arc<dyn ObjectStore>,
+    sources: Vec<SourceFile>,
+    dir: &Path,
+    concurrency: usize,
+) -> Result<()> {
+    extract_files::<AuthorsSummary, _>(sources, dir, concurrency, |source| {
+        let store = Arc::clone(store);
+        let path = dir.join("authors").join(&source.name);
+        async move {
+            let completed = completed_authors(&path);
+            with_retries(&source, completed, || author_file(&store, &source, &path)).await
         }
     })
     .await
