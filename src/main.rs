@@ -25,6 +25,8 @@ struct Args {
     #[arg(long)]
     release: Option<String>,
     #[arg(long)]
+    lookups: bool,
+    #[arg(long)]
     index: bool,
     #[arg(long)]
     awards: bool,
@@ -38,6 +40,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     extract::run(
         &Config::load(&args.config, args.release)?,
+        args.lookups,
         args.index,
         args.awards,
         args.links,

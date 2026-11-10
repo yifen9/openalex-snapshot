@@ -68,6 +68,8 @@ const LOOKUPS: [(&str, &[Leaf]); 6] = [
             ("subfield.id", "subfield_id"),
             ("field.id", "field_id"),
             ("domain.id", "domain_id"),
+            ("description", "description"),
+            ("keywords.list.element.display_name", "keywords"),
         ],
     ),
 ];
@@ -184,15 +186,23 @@ impl Summary for AuthorsSummary {
     }
 }
 
-pub fn run(config: &Config, index: bool, awards: bool, links: bool, authors: bool) -> Result<()> {
+pub fn run(
+    config: &Config,
+    lookups: bool,
+    index: bool,
+    awards: bool,
+    links: bool,
+    authors: bool,
+) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(extract(config, index, awards, links, authors))
+    runtime.block_on(extract(config, lookups, index, awards, links, authors))
 }
 
 async fn extract(
     config: &Config,
+    lookups: bool,
     index: bool,
     awards: bool,
     links: bool,
@@ -212,6 +222,9 @@ async fn extract(
             snapshot.concurrency,
         )
         .await?;
+    }
+    if lookups {
+        return Ok(());
     }
     let works = manifest.sources("works", &snapshot.bucket)?;
     if links {

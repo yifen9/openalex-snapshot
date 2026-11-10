@@ -1,13 +1,15 @@
 use crate::authors::author_rows;
 use crate::index::index_rows;
 use crate::links::Links;
+use crate::lookup::texts;
 use crate::s3::{Manifest, column, parse_id};
 use crate::works::{bare_doi, bare_orcid, years};
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray, StructArray, UInt16Array,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Int32Array, ListArray, RecordBatch, StringArray, StructArray,
+    UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -200,4 +202,46 @@ fn authors_keep_every_record_with_its_bare_uppercase_orcid() {
         [Some("Ada"), Some("Bo"), None]
     );
     assert_eq!(counts.iter().collect::<Vec<_>>(), [Some(12), Some(0), None]);
+}
+
+#[test]
+fn topic_keywords_join_the_names_of_nested_keyword_structs() {
+    let item_fields = vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("display_name", DataType::Utf8, true),
+    ];
+    let item = StructArray::new(
+        item_fields.clone().into(),
+        vec![
+            Arc::new(StringArray::from(vec!["k1", "k2", "k3"])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                "graph theory",
+                "networks",
+                "optics",
+            ])) as ArrayRef,
+        ],
+        None,
+    );
+    let list_field = Arc::new(Field::new_list_field(
+        DataType::Struct(item_fields.into()),
+        true,
+    ));
+    let keywords = ListArray::new(
+        list_field,
+        OffsetBuffer::new(vec![0, 2, 2, 3].into()),
+        Arc::new(item),
+        Some(NullBuffer::from(vec![true, false, true])),
+    );
+    let batch = RecordBatch::try_from_iter([("keywords", Arc::new(keywords) as ArrayRef)])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let joined =
+        texts(&batch, "keywords.list.element.display_name").unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(
+        joined,
+        [
+            Some("graph theory; networks".to_string()),
+            None,
+            Some("optics".to_string())
+        ]
+    );
 }

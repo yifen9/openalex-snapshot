@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow = "1"
 arrow-array = "60"
+arrow-buffer = "60"
 arrow-schema = "60"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"

@@ -17,6 +17,7 @@ use std::sync::Arc;
 pub type Leaf = (&'static str, &'static str);
 
 const IDS: [&str; 3] = ["subfield_id", "field_id", "domain_id"];
+const SEMICOLON_LISTS: [&str; 1] = ["keywords.list.element.display_name"];
 const FLAGS: [&str; 4] = ["is_core", "is_oa", "is_in_doaj", "is_preprint_repository"];
 type Record = (u64, Vec<Option<String>>);
 
@@ -111,17 +112,39 @@ fn resolve(batch: &RecordBatch, leaf: &str) -> Result<ArrayRef> {
             .with_context(|| format!("batch has no column {first}"))?,
     );
     for part in parts {
-        let parent: &StructArray = typed(array.as_ref(), leaf)?;
-        array = Arc::clone(
-            parent
-                .column_by_name(part)
-                .with_context(|| format!("{leaf} has no member {part}"))?,
-        );
+        array = member_of(&array, part, leaf)?;
     }
     Ok(array)
 }
 
-fn texts(batch: &RecordBatch, leaf: &str) -> Result<Vec<Option<String>>> {
+fn member_of(array: &ArrayRef, part: &str, leaf: &str) -> Result<ArrayRef> {
+    if let Some(lists) = array.as_any().downcast_ref::<ListArray>() {
+        let values = member_of(lists.values(), part, leaf)?;
+        let field = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+        return Ok(Arc::new(ListArray::try_new(
+            field,
+            lists.offsets().clone(),
+            values,
+            lists.nulls().cloned(),
+        )?));
+    }
+    let parent: &StructArray = typed(array.as_ref(), leaf)?;
+    Ok(Arc::clone(
+        parent
+            .column_by_name(part)
+            .with_context(|| format!("{leaf} has no member {part}"))?,
+    ))
+}
+
+fn separator(leaf: &str) -> &'static str {
+    if SEMICOLON_LISTS.contains(&leaf) {
+        "; "
+    } else {
+        " "
+    }
+}
+
+pub fn texts(batch: &RecordBatch, leaf: &str) -> Result<Vec<Option<String>>> {
     let array = resolve(batch, leaf)?;
     let rows = 0..array.len();
     Ok(match array.data_type() {
@@ -149,7 +172,7 @@ fn texts(batch: &RecordBatch, leaf: &str) -> Result<Vec<Option<String>>> {
                     (offsets[i] as usize..offsets[i + 1] as usize)
                         .filter_map(|j| optional(values, j))
                         .collect::<Vec<_>>()
-                        .join(" ")
+                        .join(separator(leaf))
                 })
             })
             .collect()
