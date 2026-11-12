@@ -1,4 +1,5 @@
 use crate::authors::author_rows;
+use crate::authorships::authorship_rows;
 use crate::index::index_rows;
 use crate::links::Links;
 use crate::lookup::texts;
@@ -7,7 +8,7 @@ use crate::works::{bare_doi, bare_orcid, years};
 use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int32Array, ListArray, RecordBatch, StringArray, StructArray,
-    UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
@@ -202,6 +203,67 @@ fn authors_keep_every_record_with_its_bare_uppercase_orcid() {
         [Some("Ada"), Some("Bo"), None]
     );
     assert_eq!(counts.iter().collect::<Vec<_>>(), [Some(12), Some(0), None]);
+}
+
+#[test]
+fn authorships_list_every_author_of_kept_works_in_order() {
+    let author = StructArray::from(vec![(
+        Arc::new(Field::new("id", DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec![
+            Some("https://openalex.org/A5"),
+            None,
+            Some("A9"),
+            Some("A2"),
+        ])) as ArrayRef,
+    )]);
+    let item = StructArray::from(vec![
+        (
+            Arc::new(Field::new("author", author.data_type().clone(), true)),
+            Arc::new(author) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("author_position", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![
+                Some("first"),
+                Some("last"),
+                Some("first"),
+                None,
+            ])) as ArrayRef,
+        ),
+    ]);
+    let authorships = ListArray::new(
+        Arc::new(Field::new_list_field(item.data_type().clone(), true)),
+        OffsetBuffer::new(vec![0, 2, 3, 3, 4].into()),
+        Arc::new(item),
+        None,
+    );
+    let columns: [(&str, ArrayRef); 4] = [
+        (
+            "id",
+            Arc::new(StringArray::from(vec!["W1", "W2", "W3", "W4"])),
+        ),
+        (
+            "publication_year",
+            Arc::new(Int32Array::from(vec![2001, 1980, 2002, 2003])),
+        ),
+        (
+            "is_xpac",
+            Arc::new(BooleanArray::from(vec![false, false, false, true])),
+        ),
+        ("authorships", Arc::new(authorships)),
+    ];
+    let batch = RecordBatch::try_from_iter(columns).unwrap_or_else(|e| panic!("{e}"));
+    let (rows, works) =
+        authorship_rows(&batch, &years(1990, 2025)).unwrap_or_else(|e| panic!("{e:#}"));
+    let ids: &UInt64Array = column(&rows, "work_id").unwrap_or_else(|e| panic!("{e:#}"));
+    let ranks: &UInt16Array = column(&rows, "rank").unwrap_or_else(|e| panic!("{e:#}"));
+    let authors: &UInt64Array = column(&rows, "author_id").unwrap_or_else(|e| panic!("{e:#}"));
+    let positions: &UInt8Array = column(&rows, "position").unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(works, 2);
+    assert_eq!(ids.values().to_vec(), [1, 1]);
+    assert_eq!(ranks.values().to_vec(), [0, 1]);
+    assert_eq!(authors.iter().collect::<Vec<_>>(), [Some(5), None]);
+    assert_eq!(positions.values().to_vec(), [0, 2]);
 }
 
 #[test]

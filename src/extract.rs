@@ -1,4 +1,5 @@
 use crate::authors::{author_file, completed_authors};
+use crate::authorships::{authorship_file, completed_authorships};
 use crate::awards::{award_file, completed_awards};
 use crate::config::Config;
 use crate::index::{completed_index, index_file};
@@ -186,6 +187,27 @@ impl Summary for AuthorsSummary {
     }
 }
 
+#[derive(Debug, Default, Serialize)]
+struct AuthorshipsSummary {
+    files: u64,
+    records: u64,
+    works: u64,
+    authorships: u64,
+    bytes: u64,
+}
+
+impl Summary for AuthorshipsSummary {
+    const NAME: &'static str = "authorships";
+
+    fn add(&mut self, stats: &FileStats) {
+        self.files += 1;
+        self.records += stats.records;
+        self.works += stats.works;
+        self.authorships += stats.rows;
+        self.bytes += stats.bytes;
+    }
+}
+
 pub fn run(
     config: &Config,
     lookups: bool,
@@ -193,11 +215,20 @@ pub fn run(
     awards: bool,
     links: bool,
     authors: bool,
+    authorships: bool,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(extract(config, lookups, index, awards, links, authors))
+    runtime.block_on(extract(
+        config,
+        lookups,
+        index,
+        awards,
+        links,
+        authors,
+        authorships,
+    ))
 }
 
 async fn extract(
@@ -207,6 +238,7 @@ async fn extract(
     awards: bool,
     links: bool,
     authors: bool,
+    authorships: bool,
 ) -> Result<()> {
     let snapshot = &config.snapshot;
     let store = store(snapshot)?;
@@ -232,6 +264,9 @@ async fn extract(
     }
     if index {
         return extract_index(&store, works, &dir, config).await;
+    }
+    if authorships {
+        return extract_authorships(&store, works, &dir, config).await;
     }
     if awards {
         extract_lookup(
@@ -298,6 +333,27 @@ async fn extract_index(
             let completed = completed_index(&path, min_year, max_year);
             with_retries(&source, completed, || {
                 index_file(&store, &source, &path, min_year, max_year)
+            })
+            .await
+        }
+    })
+    .await
+}
+
+async fn extract_authorships(
+    store: &Arc<dyn ObjectStore>,
+    sources: Vec<SourceFile>,
+    dir: &Path,
+    config: &Config,
+) -> Result<()> {
+    let (min_year, max_year) = (config.corpus.min_year, config.corpus.max_year);
+    extract_files::<AuthorshipsSummary, _>(sources, dir, config.snapshot.concurrency, |source| {
+        let store = Arc::clone(store);
+        let path = dir.join("authorships").join(&source.name);
+        async move {
+            let completed = completed_authorships(&path, min_year, max_year);
+            with_retries(&source, completed, || {
+                authorship_file(&store, &source, &path, min_year, max_year)
             })
             .await
         }

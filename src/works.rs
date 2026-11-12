@@ -271,7 +271,7 @@ pub fn kept(years: &Range<i32>, xpac: &BooleanArray, year: &Int32Array, index: u
         && years.contains(&year.value(index))
 }
 
-fn position_code(value: Option<&str>) -> u8 {
+pub fn position_code(value: Option<&str>) -> u8 {
     match value {
         Some("first") => 0,
         Some("middle") => 1,
